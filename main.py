@@ -3,25 +3,41 @@ import warnings
 warnings.filterwarnings('ignore')
 
 import torch
+import torch_npu
 import torch.nn as nn
 import torchvision
 import torchvision.transforms as transforms
 from torch.optim.lr_scheduler import CosineAnnealingLR
+
 from tqdm import tqdm
 from PIL import Image
+from datasets import load_dataset
+from torch.utils.data import DataLoader
+
 from transformers import ViTConfig, ViTModel, ViTImageProcessor
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 
 model_dir = "./Qwen3-0.6B"
 
 class X_demo(nn.Module):
-    def __init__(self, vision_dim=768, text_dim=1024):
+    def __init__(self, vision_dim=768):
         super(X_demo, self).__init__()
         self.vision_dim = vision_dim
-        self.text_dim = text_dim
-        self.merged_dim = vision_dim + text_dim  
+        self.device = torch.device("npu:0")
         self.__get_model__()
+
+        self.config = self.llm.config
+        self.config.vision_dim = vision_dim
+        self.text_dim = self.config.hidden_size
+        self.rms_norm_eps = self.config.rms_norm_eps
+        self.head_dim = self.config.head_dim
+        self.num_attention_heads = self.config.num_attention_heads
+        self.num_key_value_heads = self.config.num_key_value_heads
+        self.merged_dim = vision_dim + self.text_dim
+        self.bias = self.config.attention_bias
         self.__modify_llm_layers__()  
+        print(self.llm)
         
     def __get_model__(self):
         # Qwen3
@@ -31,7 +47,7 @@ class X_demo(nn.Module):
             device_map="npu"
         )
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=False)
-        
+
         # ViT
         self.image_processor = ViTImageProcessor(
             do_resize=True,
@@ -59,23 +75,31 @@ class X_demo(nn.Module):
             old_k_weight = attention.k_proj.weight.data.clone()
             old_v_weight = attention.v_proj.weight.data.clone()
             old_o_weight = attention.o_proj.weight.data.clone()
-            
+
             # 创建新的线性层 (从merged_dim到原始输出维度)
-            attention.q_proj = nn.Linear(self.merged_dim, old_q_weight.shape[0]+self.vision_dim, bias=False).to(old_q_weight.device)
-            attention.k_proj = nn.Linear(self.merged_dim, old_k_weight.shape[0]+self.vision_dim, bias=False).to(old_k_weight.device)
-            attention.v_proj = nn.Linear(self.merged_dim, old_v_weight.shape[0]+self.vision_dim, bias=False).to(old_v_weight.device)
+            attention.q_proj = nn.Linear(self.merged_dim , old_q_weight.shape[0]+self.vision_dim, bias=self.bias).to(old_q_weight.device)
+            attention.k_proj = nn.Linear(self.merged_dim , old_k_weight.shape[0]+self.vision_dim, bias=self.bias).to(old_k_weight.device)
+            attention.v_proj = nn.Linear(self.merged_dim , old_v_weight.shape[0]+self.vision_dim, bias=self.bias).to(old_v_weight.device)
+            attention.o_proj = nn.Linear(old_o_weight.shape[1]+self.vision_dim, self.merged_dim , bias=self.bias).to(old_o_weight.device)
             
+            # TODO: 注意力层中也有Qwen3RMSNorm
+            old_q_norm = attention.q_norm.weight.data.clone()
+            old_k_norm = attention.k_norm.weight.data.clone()
+            attention.q_norm = Qwen3RMSNorm((old_q_weight.shape[0]+self.vision_dim)//self.num_attention_heads).to(old_q_norm.device)
+            attention.k_norm = Qwen3RMSNorm((old_k_weight.shape[0]+self.vision_dim)//self.num_key_value_heads).to(old_k_norm.device)
+
             # 初始化新权重 - 将原始权重复制到前text_dim列，其余部分用零初始化
             with torch.no_grad():
-                attention.q_proj.weight.data[:self.text_dim, :old_q_weight.shape[1]] = old_q_weight    
-                attention.k_proj.weight.data[:self.text_dim, :old_k_weight.shape[1]] = old_k_weight          
-                attention.v_proj.weight.data[:self.text_dim, :old_v_weight.shape[1]] = old_v_weight
-
+                attention.q_proj.weight.data[:old_q_weight.shape[0], :self.text_dim] = old_q_weight    
+                attention.k_proj.weight.data[:old_k_weight.shape[0], :self.text_dim] = old_k_weight          
+                attention.v_proj.weight.data[:old_v_weight.shape[0], :self.text_dim] = old_v_weight
+                attention.o_proj.weight.data[:self.text_dim, :old_o_weight.shape[1]] = old_o_weight
+                attention.q_norm.weight.data[:old_q_norm.shape[0]] = old_q_norm
+                attention.k_norm.weight.data[:old_k_norm.shape[0]] = old_k_norm
             
             # 修改RMSNorm层
-            # 输入归一化
             old_input_norm_weight = layer.input_layernorm.weight.data.clone()
-            layer.input_layernorm = nn.RMSNorm(self.merged_dim, eps=layer.input_layernorm.eps).to(old_input_norm_weight.device)
+            layer.input_layernorm = Qwen3RMSNorm(self.merged_dim).to(old_input_norm_weight.device)
             
             with torch.no_grad():
                 # 将原始权重扩展到新维度，新增部分初始化为1
@@ -84,7 +108,7 @@ class X_demo(nn.Module):
             
             # 后归一化
             old_post_norm_weight = layer.post_attention_layernorm.weight.data.clone()
-            layer.post_attention_layernorm = nn.RMSNorm(self.merged_dim, eps=layer.post_attention_layernorm.eps).to(old_post_norm_weight.device)
+            layer.post_attention_layernorm = Qwen3RMSNorm(self.merged_dim).to(old_post_norm_weight.device)
             
             with torch.no_grad():
                 layer.post_attention_layernorm.weight.data[:self.text_dim] = old_post_norm_weight
@@ -99,20 +123,26 @@ class X_demo(nn.Module):
             old_down_weight = mlp.down_proj.weight.data.clone()
             
             # 修改gate_proj和up_proj (输入维度从text_dim变为merged_dim)
-            mlp.gate_proj = nn.Linear(self.merged_dim, old_gate_weight.shape[0], bias=False).to(old_gate_weight.device)
-            mlp.up_proj = nn.Linear(self.merged_dim, old_up_weight.shape[0], bias=False).to(old_up_weight.device)
+            mlp.gate_proj = nn.Linear(self.merged_dim, old_gate_weight.shape[0], bias=self.bias).to(old_gate_weight.device)
+            mlp.up_proj = nn.Linear(self.merged_dim, old_up_weight.shape[0], bias=self.bias).to(old_up_weight.device)
+            mlp.down_proj = nn.Linear(old_down_weight.shape[1], self.merged_dim, bias=self.bias).to(old_down_weight.device)
             
             with torch.no_grad():
-                mlp.gate_proj.weight.data[:self.text_dim, :old_gate_weight.shape[1]] = old_gate_weight  
-                mlp.up_proj.weight.data[:self.text_dim, :old_up_weight.shape[1]] = old_up_weight
+                mlp.gate_proj.weight.data[ :old_gate_weight.shape[0], :self.text_dim] = old_gate_weight  
+                mlp.up_proj.weight.data[:old_up_weight.shape[0], :self.text_dim] = old_up_weight
+                mlp.down_proj.weight.data[:self.text_dim, :old_down_weight.shape[1]] = old_down_weight
         
         # 修改最终的norm层
         old_final_norm_weight = self.llm.model.norm.weight.data.clone()
-        self.llm.model.norm = nn.RMSNorm(self.merged_dim, eps=self.llm.model.norm.eps).to(old_final_norm_weight.device)
-        
+        self.llm.model.norm = Qwen3RMSNorm(self.merged_dim).to(old_final_norm_weight.device)
+        old_lm_head_weight = self.llm.lm_head.weight.data.clone()
+        self.llm.lm_head = nn.Linear(self.merged_dim, old_lm_head_weight.shape[0], bias=self.bias).to(old_lm_head_weight.device)
+
         with torch.no_grad():
             self.llm.model.norm.weight.data[:self.text_dim] = old_final_norm_weight
             self.llm.model.norm.weight.data[self.text_dim:] = 1.0
+            self.llm.lm_head.weight.data[:,:self.text_dim] = old_lm_head_weight
+
 
     def __get_patch_embed__(self, image):
         inputs = self.image_processor(images=image, return_tensors="pt")
@@ -201,19 +231,20 @@ class X_demo(nn.Module):
     def forward(self, image, text, target_answer=None):
         self.image, self.text = image, text
         
-        # 获取图像和文本嵌入
-        image_embed = self.__get_patch_embed__(image)
-        text_embed = self.__get_text_embed__(text)
-        
+        # 获取图像和文本嵌入(文本相同，BatchSize要和图像的对齐)
+        image_embed = self.__get_patch_embed__(image).to(self.device)
+        text_embed = self.__get_text_embed__(text).to(self.device)
+        text_embed = text_embed.repeat(image_embed.shape[0], 1, 1)
+
         # 合并嵌入
-        merge_embed = torch.cat([image_embed, text_embed], dim=1)
+        merge_embed = torch.cat([image_embed, text_embed], dim=1).to(self.device)
         
         # 将merge_embed送入LLM的decoder
         # 注意：由于我们修改了模型结构，直接使用generate可能需要额外处理
         # 这里展示如何通过模型的forward传递
         
         # 创建attention mask
-        attention_mask = torch.ones(merge_embed.shape[:2], device=merge_embed.device, dtype=torch.long)
+        attention_mask = torch.ones(merge_embed.shape[:2], device=self.device, dtype=torch.long)
         
         # 通过LLM处理
         outputs = self.llm.model(
@@ -234,21 +265,49 @@ class X_demo(nn.Module):
         return {"logits": logits, "loss": loss}
 
 if __name__ == "__main__":
-    model = X_demo(vision_dim=768, text_dim=1024)
+    model = X_demo(vision_dim=768).to(torch.device("npu:0"))
     
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-    
-    # 下载并加载 CIFAR-100 训练集
-    trainset = torchvision.datasets.CIFAR100(root='./data', train=True, download=True, transform=transform)
-    trainloader = torch.utils.data.DataLoader(trainset, batch_size=4, shuffle=True)
+    from datasets import load_dataset
+    from torch.utils.data import DataLoader, Dataset
+    from datasets import load_dataset, Image
 
-    # 下载并加载 CIFAR-100 测试集
-    testset = torchvision.datasets.CIFAR100(root='./data', train=False, download=True, transform=transform)
-    testloader = torch.utils.data.DataLoader(testset, batch_size=4, shuffle=False)
-    
-    cifar100_classes = trainset.classes
+    dataset = load_dataset("parquet", data_files={
+        "train": "/home/ma-user/work/zym/cifar100/cifar100/train-00000-of-00001.parquet",
+        "test": "/home/ma-user/work/zym/cifar100/cifar100/test-00000-of-00001.parquet"
+    })
+
+    # 2. cast 图像列为 PIL.Image
+    dataset = dataset.cast_column("img", Image())
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),  # 转成 Tensor，必须有！
+    ])
+
+    class CustomTorchDataset(Dataset):
+        def __init__(self, hf_dataset, transform=None):
+            self.dataset = hf_dataset
+            self.transform = transform
+
+        def __len__(self):
+            return len(self.dataset)
+
+        def __getitem__(self, idx):
+            image = self.dataset[idx]["img"]  # PIL.Image
+            label = self.dataset[idx]["fine_label"]
+            if self.transform:
+                image = self.transform(image)  # 转 Tensor
+            return image, label
+
+
+    train_dataset = CustomTorchDataset(dataset["train"], transform=transform)
+    test_dataset = CustomTorchDataset(dataset["test"], transform=transform)
+
+    # 5. DataLoader
+    trainloader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    testloader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+
+    # 6. 获取标签
+    cifar100_classes = dataset["train"]["fine_label"]
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
     scheduler = CosineAnnealingLR(optimizer, T_max=1000)
