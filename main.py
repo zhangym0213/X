@@ -6,29 +6,38 @@ import torch
 import torch_npu
 import torch.nn as nn
 import torchvision
-import torchvision.transforms as transforms
+from torchvision import transforms
 from torch.optim.lr_scheduler import CosineAnnealingLR
+import torch.distributed as dist
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.tensorboard import SummaryWriter
+import torch.multiprocessing as mp
 
+import argparse
 from tqdm import tqdm
 from PIL import Image
 from datasets import load_dataset
-from torch.utils.data import DataLoader
 
 from transformers import ViTConfig, ViTModel, ViTImageProcessor
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+from Qwen3_module import XForCausalLM
 
-model_dir = "./Qwen3-0.6B"
+model_dir = "/home/ma-user/work/zym/Qwen3-0.6B"
 
 class X_demo(nn.Module):
-    def __init__(self, vision_dim=768):
+    def __init__(self, vision_dim=768, vision_ffn=768):
         super(X_demo, self).__init__()
         self.vision_dim = vision_dim
+        self.vision_ffn = vision_ffn
         self.device = torch.device("npu:0")
+
+        self.config =  AutoConfig.from_pretrained(model_dir)
+        self.config.vision_dim = vision_dim
+        self.config.vision_ffn = vision_ffn
         self.__get_model__()
 
-        self.config = self.llm.config
-        self.config.vision_dim = vision_dim
         self.text_dim = self.config.hidden_size
         self.rms_norm_eps = self.config.rms_norm_eps
         self.head_dim = self.config.head_dim
@@ -41,13 +50,13 @@ class X_demo(nn.Module):
         
     def __get_model__(self):
         # Qwen3
-        self.llm = AutoModelForCausalLM.from_pretrained(
+        self.llm = XForCausalLM.from_pretrained(
             model_dir,
+            config=self.config,
             torch_dtype="auto",
             device_map="npu"
         )
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=False)
-
         # ViT
         self.image_processor = ViTImageProcessor(
             do_resize=True,
@@ -64,7 +73,7 @@ class X_demo(nn.Module):
             num_channels=3
         )
         self.vit = ViTModel(config)
-    
+        print(self.vit)
     def __modify_llm_layers__(self):
         for layer_idx, layer in enumerate(self.llm.model.layers):       
             # 修改注意力层的q, k, v权重
@@ -77,15 +86,15 @@ class X_demo(nn.Module):
             old_o_weight = attention.o_proj.weight.data.clone()
 
             # 创建新的线性层 (从merged_dim到原始输出维度)
-            attention.q_proj = nn.Linear(self.merged_dim , old_q_weight.shape[0]+self.vision_dim, bias=self.bias).to(old_q_weight.device)
+            attention.q_proj = nn.Linear(self.merged_dim , old_q_weight.shape[0]+self.vision_dim*2, bias=self.bias).to(old_q_weight.device)
             attention.k_proj = nn.Linear(self.merged_dim , old_k_weight.shape[0]+self.vision_dim, bias=self.bias).to(old_k_weight.device)
             attention.v_proj = nn.Linear(self.merged_dim , old_v_weight.shape[0]+self.vision_dim, bias=self.bias).to(old_v_weight.device)
-            attention.o_proj = nn.Linear(old_o_weight.shape[1]+self.vision_dim, self.merged_dim , bias=self.bias).to(old_o_weight.device)
+            attention.o_proj = nn.Linear(old_o_weight.shape[1]+self.vision_dim*2, self.merged_dim , bias=self.bias).to(old_o_weight.device)
             
-            # TODO: 注意力层中也有Qwen3RMSNorm
+            # 注意力层中也有Qwen3RMSNorm
             old_q_norm = attention.q_norm.weight.data.clone()
             old_k_norm = attention.k_norm.weight.data.clone()
-            attention.q_norm = Qwen3RMSNorm((old_q_weight.shape[0]+self.vision_dim)//self.num_attention_heads).to(old_q_norm.device)
+            attention.q_norm = Qwen3RMSNorm((old_q_weight.shape[0]+self.vision_dim*2)//self.num_attention_heads).to(old_q_norm.device)
             attention.k_norm = Qwen3RMSNorm((old_k_weight.shape[0]+self.vision_dim)//self.num_key_value_heads).to(old_k_norm.device)
 
             # 初始化新权重 - 将原始权重复制到前text_dim列，其余部分用零初始化
@@ -123,9 +132,9 @@ class X_demo(nn.Module):
             old_down_weight = mlp.down_proj.weight.data.clone()
             
             # 修改gate_proj和up_proj (输入维度从text_dim变为merged_dim)
-            mlp.gate_proj = nn.Linear(self.merged_dim, old_gate_weight.shape[0], bias=self.bias).to(old_gate_weight.device)
-            mlp.up_proj = nn.Linear(self.merged_dim, old_up_weight.shape[0], bias=self.bias).to(old_up_weight.device)
-            mlp.down_proj = nn.Linear(old_down_weight.shape[1], self.merged_dim, bias=self.bias).to(old_down_weight.device)
+            mlp.gate_proj = nn.Linear(self.merged_dim, old_gate_weight.shape[0]+self.vision_ffn, bias=self.bias).to(old_gate_weight.device)
+            mlp.up_proj = nn.Linear(self.merged_dim, old_up_weight.shape[0]+self.vision_ffn, bias=self.bias).to(old_up_weight.device)
+            mlp.down_proj = nn.Linear(old_down_weight.shape[1]+self.vision_ffn, self.merged_dim, bias=self.bias).to(old_down_weight.device)
             
             with torch.no_grad():
                 mlp.gate_proj.weight.data[ :old_gate_weight.shape[0], :self.text_dim] = old_gate_weight  
@@ -263,99 +272,152 @@ class X_demo(nn.Module):
             loss = self.compute_loss(logits, target_answer, merge_embed.shape[1])
         
         return {"logits": logits, "loss": loss}
-
-if __name__ == "__main__":
-    model = X_demo(vision_dim=768).to(torch.device("npu:0"))
     
-    from datasets import load_dataset
-    from torch.utils.data import DataLoader, Dataset
-    from datasets import load_dataset, Image
+class ImagenetQADataset(Dataset):
+    def __init__(self, split="train"):
+        self.dataset = load_dataset("/cache/imagenet-1k/imagenet_zym.py", split=split, trust_remote_code=True)
+        self.prompt = "What is in the image?"
 
-    dataset = load_dataset("parquet", data_files={
-        "train": "/home/ma-user/work/zym/cifar100/cifar100/train-00000-of-00001.parquet",
-        "test": "/home/ma-user/work/zym/cifar100/cifar100/test-00000-of-00001.parquet"
-    })
+    def __len__(self):
+        return len(self.dataset)
 
-    # 2. cast 图像列为 PIL.Image
-    dataset = dataset.cast_column("img", Image())
+    def __getitem__(self, idx):
+        ex = self.dataset[idx]
+        image = ex["image"]
+        label = ex["label"]
+        return image, self.prompt, label
 
-    transform = transforms.Compose([
-        transforms.ToTensor(),  # 转成 Tensor，必须有！
-    ])
+def collate_fn(batch):
+    images, prompts, labels = zip(*batch)
+    return list(images), list(prompts), torch.tensor(labels)
 
-    class CustomTorchDataset(Dataset):
-        def __init__(self, hf_dataset, transform=None):
-            self.dataset = hf_dataset
-            self.transform = transform
+class XTrainer:
+    def __init__(self, model, args):
+        self.model = model
+        self.epochs = args.epochs
+        self.batch_size = args.batch_size
+        self.lr = args.learning_rate
+        self.device = torch.npu.current_device()
+        self.log_dir = args.log_dir
 
-        def __len__(self):
-            return len(self.dataset)
+        self.model = model
+        self.rank = int(os.environ["RANK"])
+        self.world_size = int(os.environ["WORLD_SIZE"])
 
-        def __getitem__(self, idx):
-            image = self.dataset[idx]["img"]  # PIL.Image
-            label = self.dataset[idx]["fine_label"]
-            if self.transform:
-                image = self.transform(image)  # 转 Tensor
-            return image, label
+        self.tokenizer = model.tokenizer
+        self.device = torch.device("npu")
 
+        self.train_dataset = ImagenetQADataset("train")
+        self.val_dataset = ImagenetQADataset("validation")
 
-    train_dataset = CustomTorchDataset(dataset["train"], transform=transform)
-    test_dataset = CustomTorchDataset(dataset["test"], transform=transform)
+        self.train_sampler = torch.utils.data.distributed.DistributedSampler(self.train_dataset, shuffle=True)
+        self.val_sampler = torch.utils.data.distributed.DistributedSampler(self.val_dataset, shuffle=False)
 
-    # 5. DataLoader
-    trainloader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-    testloader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+        self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, sampler=self.train_sampler, num_workers=4)
+        self.val_loader = DataLoader(self.val_dataset, batch_size=self.batch_size, sampler=self.val_sampler, num_workers=4)
 
-    # 6. 获取标签
-    cifar100_classes = dataset["train"]["fine_label"]
-    
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
-    scheduler = CosineAnnealingLR(optimizer, T_max=1000)
-    
-    max_epoch = 10
+        self.model = DDP(self.model.to(self.device), device_ids=[self.rank])
 
-    for epoch in tqdm(range(max_epoch)):
-        model.train()
-        total_loss = 0
-        for images, labels in trainloader:
-            outputs = model(images, "What is in the image?", [cifar100_classes[label] for label in labels])
-            loss = outputs["loss"]
-            total_loss += loss.item()
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.epochs * len(self.train_loader))
+        self.writer = SummaryWriter(self.log_dir) if self.rank == 0 else None
 
-            # 反向传播
-            optimizer.zero_grad()  # 清空梯度
-            loss.backward()  # 计算梯度
+    def compute_accuracy(self, logits, labels):
+        pred_ids = torch.argmax(logits, dim=-1)
+        correct = 0
+        total = 0
+        for pred, target in zip(pred_ids, labels):
+            pred_text = self.tokenizer.decode(pred, skip_special_tokens=True)
+            target_text = self.tokenizer.decode(target, skip_special_tokens=True)
+            if pred_text.strip().lower() in target_text.strip().lower():
+                correct += 1
+            total += 1
+        return correct / total
 
-            # 梯度裁剪(可选，防止梯度爆炸)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    def train(self):
+        global_step = 0
+        for epoch in range(self.epochs):
+            self.model.train()
+            self.train_sampler.set_epoch(epoch)
+            running_loss = 0.0
+            for step, (images, texts, labels) in tqdm(enumerate(self.train_loader)):
+                answers = [self.train_dataset.dataset.features["label"].int2str(label.item()) for label in labels]
+                tokenized = self.tokenizer(answers, return_tensors="pt", padding=True).input_ids.to(self.device)
 
-            optimizer.step()  # 更新参数
+                outputs = self.model(images, texts, tokenized)
+                loss = outputs["loss"]
+                loss.backward()
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+                self.scheduler.step()
 
-            # 更新学习率
-            if scheduler is not None:
-                scheduler.step()
-        
-        print(f"Epoch {epoch + 1}/{max_epoch}, Train Loss: {total_loss / len(trainloader)}")
-        
-        model.eval()
+                running_loss += loss.item()
+
+                if step % 100 == 0 and self.rank == 0:
+                    avg_loss = running_loss / (step + 1)
+                    print(f"Epoch {epoch} Step {step}: Loss = {avg_loss:.4f}")
+                    self.writer.add_scalar("train/loss", avg_loss, global_step)
+                global_step += 1
+
+            if self.rank == 0:
+                val_loss, val_acc = self.evaluate()
+                print(f"Epoch {epoch} finished. Val Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}")
+                self.writer.add_scalar("val/loss", val_loss, epoch)
+                self.writer.add_scalar("val/accuracy", val_acc, epoch)
+
+    def evaluate(self):
+        self.model.eval()
+        total_loss = 0.0
         correct = 0
         total = 0
         with torch.no_grad():
-            for images, labels in testloader:
-                outputs = model(images, "What is in the image?", [cifar100_classes[label] for label in labels])
+            for images, texts, labels in tqdm(self.val_loader):
+                answers = [self.val_dataset.dataset.features["label"].int2str(label.item()) for label in labels]
+                tokenized = self.tokenizer(answers, return_tensors="pt", padding=True).input_ids.to(self.device)
+
+                outputs = self.model(images, texts, tokenized)
+                total_loss += outputs["loss"].item()
                 logits = outputs["logits"]
-                _, predicted = torch.max(logits, dim=2)
-                total += labels.size(0)
-                correct += (predicted[:, -1] == labels).sum().item()
-        
-        print(f"Test Accuracy: {100 * correct / total:.2f}%")
-        
-        # 展示 10 个例子的模型输出文本
-        with torch.no_grad():
-            for images, labels in testloader:
-                outputs = model(images, "What is in the image?")
-                logits = outputs["logits"]
-                _, predicted = torch.max(logits, dim=2)
-                for i in range(min(10, len(images))):
-                    print(f"Image {i + 1}: Predicted: {cifar100_classes[predicted[i, -1]]}, Actual: {cifar100_classes[labels[i]]}")
-                break
+                acc = self.compute_accuracy(logits, tokenized)
+                correct += acc * len(images)
+                total += len(images)
+
+        avg_loss = total_loss / len(self.val_loader)
+        accuracy = correct / total
+        return avg_loss, accuracy 
+
+def run_demo(rank, world_size, args):
+    os.environ['RANK'] = str(rank)            
+    os.environ['LOCAL_RANK'] = str(rank)      
+    os.environ['WORLD_SIZE'] = str(world_size)
+    os.environ['MASTER_ADDR'] = '127.0.0.1'  
+    os.environ['MASTER_PORT'] = '6666'
+    os.environ["HF_DATASETS_CACHE"] = "/cache/"
+
+    torch.npu.set_device(rank)  # 分配每个进程对应的设备
+    dist.init_process_group(backend='hccl', rank=rank, world_size=world_size)
+    
+    model = X_demo()
+    trainer = XTrainer(model, args)  
+    trainer.train()
+    
+    dist.destroy_process_group()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="NPU Distributed Training")
+    parser.add_argument('--epochs', type=int, default=5, help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size per NPU')
+    parser.add_argument('--learning_rate', type=float, default=1e-5, help='Learning rate')
+    parser.add_argument('--output_dir', type=str, default='./outputs', help='Where to save checkpoints')
+    parser.add_argument('--log_dir', type=str, default='./logs', help='TensorBoard log dir')
+    parser.add_argument('--local_rank', type=int, default=0, help='Local rank passed by torchrun')
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    args = parse_args()    
+    torch.npu.set_device(args.local_rank)
+    world_size = torch.npu.device_count()
+    mp.spawn(run_demo, args=(world_size, args), nprocs=world_size, join=True)
+
+    
