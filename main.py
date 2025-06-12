@@ -9,20 +9,18 @@ import torchvision
 from torchvision import transforms
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import torch.distributed as dist
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 import torch.multiprocessing as mp
 
 import argparse
 from tqdm import tqdm
-from PIL import Image
-from datasets import load_dataset
 
-from transformers import ViTConfig, ViTModel, ViTImageProcessor
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from transformers import ViTConfig, ViTModel, AutoConfig
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 from Qwen3_module import XForCausalLM
+from utils import ImagenetQADataset
 
 model_dir = "/home/ma-user/work/zym/Qwen3-0.6B"
 
@@ -45,9 +43,10 @@ class X_demo(nn.Module):
         self.num_key_value_heads = self.config.num_key_value_heads
         self.merged_dim = vision_dim + self.text_dim
         self.bias = self.config.attention_bias
-        self.__modify_llm_layers__()  
+        self.__modify_llm_layers__()
+        print(self.vit)  
         print(self.llm)
-        
+            
     def __get_model__(self):
         # Qwen3
         self.llm = XForCausalLM.from_pretrained(
@@ -56,24 +55,19 @@ class X_demo(nn.Module):
             torch_dtype="auto",
             device_map="npu"
         )
-        self.tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=False)
+        
         # ViT
-        self.image_processor = ViTImageProcessor(
-            do_resize=True,
-            size={"height": 224, "width": 224},
-            do_normalize=True
-        )
-        config = ViTConfig(
+        self.vit = ViTModel(
+            config = ViTConfig(
             hidden_size=self.vision_dim,
             num_hidden_layers=12,
             num_attention_heads=12,
             intermediate_size=3072,
             image_size=224,
             patch_size=16,
-            num_channels=3
+            num_channels=3)
         )
-        self.vit = ViTModel(config)
-        print(self.vit)
+
     def __modify_llm_layers__(self):
         for layer_idx, layer in enumerate(self.llm.model.layers):       
             # 修改注意力层的q, k, v权重
@@ -152,30 +146,7 @@ class X_demo(nn.Module):
             self.llm.model.norm.weight.data[self.text_dim:] = 1.0
             self.llm.lm_head.weight.data[:,:self.text_dim] = old_lm_head_weight
 
-
-    def __get_patch_embed__(self, image):
-        inputs = self.image_processor(images=image, return_tensors="pt")
-        pixel_values = inputs['pixel_values'].to(self.vit.device)
-        
-        # 去掉一个[CLS]，[Batch Size, Patch Num, Vision Dim]
-        patch_embeds = self.vit.embeddings(pixel_values)[:, 1:, :]
-        
-        # 创建零向量用于拼接
-        pad = torch.zeros(
-            patch_embeds.size(0),
-            patch_embeds.size(1),
-            self.text_dim,
-            dtype=patch_embeds.dtype,
-            device=patch_embeds.device
-        )
-        
-        # 拼接到最后一个维度：shape -> [B, N, vision_dim + text_dim]
-        patch_embeds_padded = torch.cat([patch_embeds, pad], dim=-1)
-        return patch_embeds_padded
-
-    def __get_text_embed__(self, text):
-        inputs = self.tokenizer(text, return_tensors="pt")
-        input_ids = inputs["input_ids"].to(self.llm.device)
+    def __get_text_embed__(self, input_ids):
         text_embeds = self.llm.model.embed_tokens(input_ids)
         
         # 创建零向量用于拼接
@@ -187,9 +158,28 @@ class X_demo(nn.Module):
             device=text_embeds.device
         )
         
+        print(text_embeds.shape)
+        print(pad.shape)
         # 拼接到最后一个维度：shape -> [B, N, vision_dim + text_dim]
         text_embeds_padded = torch.cat([pad, text_embeds], dim=-1)  # 注意这里调整了拼接顺序
         return text_embeds_padded
+    
+    def __get_patch_embed__(self, pixel_values):        
+        # 去掉一个[CLS]，[Batch Size, Patch Num, Vision Dim]
+        image_embeds = self.vit.embeddings(pixel_values)[:, 1:, :]
+
+        # 创建零向量用于拼接
+        pad = torch.zeros(
+            image_embeds.size(0),
+            image_embeds.size(1),
+            self.text_dim,
+            dtype=image_embeds.dtype,
+            device=image_embeds.device
+        )
+
+        # 拼接到最后一个维度：shape -> [B, N, vision_dim + text_dim]
+        image_embeds_padded = torch.cat([image_embeds, pad], dim=-1)  # 注意这里调整了拼接顺序
+        return image_embeds_padded
     
     def compute_loss(self, logits, target_answer, input_length):
         """
@@ -240,10 +230,9 @@ class X_demo(nn.Module):
     def forward(self, image, text, target_answer=None):
         self.image, self.text = image, text
         
-        # 获取图像和文本嵌入(文本相同，BatchSize要和图像的对齐)
-        image_embed = self.__get_patch_embed__(image).to(self.device)
-        text_embed = self.__get_text_embed__(text).to(self.device)
-        text_embed = text_embed.repeat(image_embed.shape[0], 1, 1)
+        # 获取图像和文本嵌入(input_ids & pixel_values)
+        text_embed = self.__get_text_embed__(self.text).to(self.device)
+        image_embed = self.__get_image_embed__(self.image).to(self.device)
 
         # 合并嵌入
         merge_embed = torch.cat([image_embed, text_embed], dim=1).to(self.device)
@@ -273,23 +262,7 @@ class X_demo(nn.Module):
         
         return {"logits": logits, "loss": loss}
     
-class ImagenetQADataset(Dataset):
-    def __init__(self, split="train"):
-        self.dataset = load_dataset("/cache/imagenet-1k/imagenet_zym.py", split=split, trust_remote_code=True)
-        self.prompt = "What is in the image?"
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        ex = self.dataset[idx]
-        image = ex["image"]
-        label = ex["label"]
-        return image, self.prompt, label
-
-def collate_fn(batch):
-    images, prompts, labels = zip(*batch)
-    return list(images), list(prompts), torch.tensor(labels)
+  
 
 class XTrainer:
     def __init__(self, model, args):
@@ -297,18 +270,14 @@ class XTrainer:
         self.epochs = args.epochs
         self.batch_size = args.batch_size
         self.lr = args.learning_rate
-        self.device = torch.npu.current_device()
+        self.device = torch.device("npu")
         self.log_dir = args.log_dir
 
-        self.model = model
         self.rank = int(os.environ["RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
 
-        self.tokenizer = model.tokenizer
-        self.device = torch.device("npu")
-
-        self.train_dataset = ImagenetQADataset("train")
-        self.val_dataset = ImagenetQADataset("validation")
+        self.train_dataset = ImagenetQADataset(split="train")
+        self.val_dataset = ImagenetQADataset(split= "val")
 
         self.train_sampler = torch.utils.data.distributed.DistributedSampler(self.train_dataset, shuffle=True)
         self.val_sampler = torch.utils.data.distributed.DistributedSampler(self.val_dataset, shuffle=False)
@@ -340,11 +309,8 @@ class XTrainer:
             self.model.train()
             self.train_sampler.set_epoch(epoch)
             running_loss = 0.0
-            for step, (images, texts, labels) in tqdm(enumerate(self.train_loader)):
-                answers = [self.train_dataset.dataset.features["label"].int2str(label.item()) for label in labels]
-                tokenized = self.tokenizer(answers, return_tensors="pt", padding=True).input_ids.to(self.device)
-
-                outputs = self.model(images, texts, tokenized)
+            for step, (img, text, label) in tqdm(enumerate(self.train_loader)):
+                outputs = self.model(img, text, label)
                 loss = outputs["loss"]
                 loss.backward()
                 self.optimizer.step()
