@@ -5,22 +5,15 @@ warnings.filterwarnings('ignore')
 import torch
 import torch_npu
 import torch.nn as nn
-import torchvision
-from torchvision import transforms
-from torch.optim.lr_scheduler import CosineAnnealingLR
 import torch.distributed as dist
-from torch.utils.data import DataLoader
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.tensorboard import SummaryWriter
 import torch.multiprocessing as mp
 
 import argparse
-from tqdm import tqdm
 
 from transformers import ViTConfig, ViTModel, AutoConfig
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 from Qwen3_module import XForCausalLM
-from utils import ImagenetQADataset
+from utils import XTrainer
 
 model_dir = "/home/ma-user/work/zym/Qwen3-0.6B"
 
@@ -158,13 +151,11 @@ class X_demo(nn.Module):
             device=text_embeds.device
         )
         
-        print(text_embeds.shape)
-        print(pad.shape)
         # 拼接到最后一个维度：shape -> [B, N, vision_dim + text_dim]
         text_embeds_padded = torch.cat([pad, text_embeds], dim=-1)  # 注意这里调整了拼接顺序
         return text_embeds_padded
     
-    def __get_patch_embed__(self, pixel_values):        
+    def __get_image_embed__(self, pixel_values):        
         # 去掉一个[CLS]，[Batch Size, Patch Num, Vision Dim]
         image_embeds = self.vit.embeddings(pixel_values)[:, 1:, :]
 
@@ -181,177 +172,106 @@ class X_demo(nn.Module):
         image_embeds_padded = torch.cat([image_embeds, pad], dim=-1)  # 注意这里调整了拼接顺序
         return image_embeds_padded
     
-    def compute_loss(self, logits, target_answer, input_length):
+    def compute_loss(self, logits, target_answer,):
         """
         计算语言建模损失
         Args:
             logits: 模型输出的logits [batch_size, seq_len, vocab_size]
             target_answer: 目标答案字符串
-            input_length: 输入序列长度(用于确定答案开始位置)
         """
-        # 将目标答案转换为token ids
-        target_encoding = self.tokenizer(
-            target_answer, 
-            return_tensors="pt", 
-            add_special_tokens=False  # 不添加特殊token，因为我们只要答案部分
-        )
-        target_ids = target_encoding["input_ids"].to(logits.device)  # [1, answer_length]
-        
-        # 构建完整的目标序列
-        # 前面是输入部分(图像+问题)，后面是答案部分
-        batch_size, total_seq_len, vocab_size = logits.shape
-        
-        # 创建标签张量，初始化为-100(ignore_index)
-        labels = torch.full((batch_size, total_seq_len), -100, dtype=torch.long, device=logits.device)
-        
-        # 只在答案部分设置真实标签
-        answer_start = input_length  # 答案从输入结束后开始
-        answer_length = target_ids.shape[1]
-        
-        if answer_start + answer_length <= total_seq_len:
-            # 如果答案能完全放入序列中
-            labels[0, answer_start:answer_start + answer_length] = target_ids[0]
-        else:
-            # 如果答案超出序列长度，截断答案
-            available_length = total_seq_len - answer_start
-            if available_length > 0:
-                labels[0, answer_start:] = target_ids[0, :available_length]
+        _ , _ , vocab_size = logits.shape
         
         # 计算交叉熵损失
-        loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+        criterion = nn.CrossEntropyLoss(ignore_index=-100)
         
         # 将logits和labels重塑为2D张量
-        shift_logits = logits.view(-1, vocab_size)  # [batch_size * seq_len, vocab_size]
-        shift_labels = labels.view(-1)  # [batch_size * seq_len]
+        flat_logits = logits.view(-1, vocab_size)  # [batch_size * seq_len, vocab_size]
+        flat_labels = target_answer.view(-1)  # [batch_size * seq_len]
         
-        loss = loss_fct(shift_logits, shift_labels)
+        loss = criterion(flat_logits, flat_labels)
         return loss
     
-    def forward(self, image, text, target_answer=None):
+    def forward(self, image, text, target_answer=None, max_new_tokens=128):
         self.image, self.text = image, text
         
-        # 获取图像和文本嵌入(input_ids & pixel_values)
         text_embed = self.__get_text_embed__(self.text).to(self.device)
         image_embed = self.__get_image_embed__(self.image).to(self.device)
-
-        # 合并嵌入
+        
         merge_embed = torch.cat([image_embed, text_embed], dim=1).to(self.device)
+        attention_mask = torch.ones((merge_embed.shape[0], max_new_tokens + merge_embed.shape[1]), device=self.device, dtype=torch.long)
         
-        # 将merge_embed送入LLM的decoder
-        # 注意：由于我们修改了模型结构，直接使用generate可能需要额外处理
-        # 这里展示如何通过模型的forward传递
+        B = merge_embed.shape[0]
+        is_training = target_answer is not None
         
-        # 创建attention mask
-        attention_mask = torch.ones(merge_embed.shape[:2], device=self.device, dtype=torch.long)
+        eos_token_id = getattr(self.config, 'eos_token_id', None)
         
-        # 通过LLM处理
         outputs = self.llm.model(
             inputs_embeds=merge_embed,
-            attention_mask=attention_mask,
+            attention_mask=attention_mask[:, :merge_embed.shape[1]],
+            use_cache=True,
             return_dict=True
         )
         
-        # 获取最后的hidden states
-        hidden_states = outputs.last_hidden_state
+        past_key_values = outputs.past_key_values
+        current_logits = self.llm.lm_head(outputs.last_hidden_state[:, -1:, :])
         
-        # 通过language model head得到logits
-        logits = self.llm.lm_head(hidden_states)
+        all_logits = [] if is_training else None
+        generated_ids = torch.zeros((B, max_new_tokens), dtype=torch.long, device=self.device)  # 预分配生成的ID张量
+        eos_flags = torch.zeros(B, dtype=torch.bool, device=self.device)  # 跟踪每个样本是否完成生成
         
-        if target_answer is not None:
-            loss = self.compute_loss(logits, target_answer, merge_embed.shape[1])
+        for step in range(max_new_tokens):
+            step_logits = current_logits.squeeze(1)
+            
+            if is_training:
+                all_logits.append(step_logits)
+            
+            next_token = step_logits.argmax(-1)
+            generated_ids[:, step] = next_token  # 存储生成的token
+            
+            # 检查EOS条件
+            if eos_token_id is not None:
+                eos_flags |= (next_token == eos_token_id)
+                if eos_flags.all():
+                    break
+            
+            # 更新attention mask
+            attention_mask[:, merge_embed.shape[1] + step] = 1
+            
+            # 只为尚未完成的样本生成下一步
+            unfinished_mask = ~eos_flags
+            if unfinished_mask.any():
+                next_embed = self.llm.model.get_input_embeddings()(next_token[unfinished_mask]).unsqueeze(1)
+                outputs = self.llm.model(
+                    inputs_embeds=next_embed,
+                    attention_mask=attention_mask[unfinished_mask, :merge_embed.shape[1] + step + 1],
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    return_dict=True
+                )
+                past_key_values = outputs.past_key_values
+                current_logits = self.llm.lm_head(outputs.last_hidden_state[:, -1:, :])
+            else:
+                break
         
-        return {"logits": logits, "loss": loss}
-    
-  
-
-class XTrainer:
-    def __init__(self, model, args):
-        self.model = model
-        self.epochs = args.epochs
-        self.batch_size = args.batch_size
-        self.lr = args.learning_rate
-        self.device = torch.device("npu")
-        self.log_dir = args.log_dir
-
-        self.rank = int(os.environ["RANK"])
-        self.world_size = int(os.environ["WORLD_SIZE"])
-
-        self.train_dataset = ImagenetQADataset(split="train")
-        self.val_dataset = ImagenetQADataset(split= "val")
-
-        self.train_sampler = torch.utils.data.distributed.DistributedSampler(self.train_dataset, shuffle=True)
-        self.val_sampler = torch.utils.data.distributed.DistributedSampler(self.val_dataset, shuffle=False)
-
-        self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, sampler=self.train_sampler, num_workers=4)
-        self.val_loader = DataLoader(self.val_dataset, batch_size=self.batch_size, sampler=self.val_sampler, num_workers=4)
-
-        self.model = DDP(self.model.to(self.device), device_ids=[self.rank])
-
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr)
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.epochs * len(self.train_loader))
-        self.writer = SummaryWriter(self.log_dir) if self.rank == 0 else None
-
-    def compute_accuracy(self, logits, labels):
-        pred_ids = torch.argmax(logits, dim=-1)
-        correct = 0
-        total = 0
-        for pred, target in zip(pred_ids, labels):
-            pred_text = self.tokenizer.decode(pred, skip_special_tokens=True)
-            target_text = self.tokenizer.decode(target, skip_special_tokens=True)
-            if pred_text.strip().lower() in target_text.strip().lower():
-                correct += 1
-            total += 1
-        return correct / total
-
-    def train(self):
-        global_step = 0
-        for epoch in range(self.epochs):
-            self.model.train()
-            self.train_sampler.set_epoch(epoch)
-            running_loss = 0.0
-            for step, (img, text, label) in tqdm(enumerate(self.train_loader)):
-                outputs = self.model(img, text, label)
-                loss = outputs["loss"]
-                loss.backward()
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-                self.scheduler.step()
-
-                running_loss += loss.item()
-
-                if step % 100 == 0 and self.rank == 0:
-                    avg_loss = running_loss / (step + 1)
-                    print(f"Epoch {epoch} Step {step}: Loss = {avg_loss:.4f}")
-                    self.writer.add_scalar("train/loss", avg_loss, global_step)
-                global_step += 1
-
-            if self.rank == 0:
-                val_loss, val_acc = self.evaluate()
-                print(f"Epoch {epoch} finished. Val Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}")
-                self.writer.add_scalar("val/loss", val_loss, epoch)
-                self.writer.add_scalar("val/accuracy", val_acc, epoch)
-
-    def evaluate(self):
-        self.model.eval()
-        total_loss = 0.0
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for images, texts, labels in tqdm(self.val_loader):
-                answers = [self.val_dataset.dataset.features["label"].int2str(label.item()) for label in labels]
-                tokenized = self.tokenizer(answers, return_tensors="pt", padding=True).input_ids.to(self.device)
-
-                outputs = self.model(images, texts, tokenized)
-                total_loss += outputs["loss"].item()
-                logits = outputs["logits"]
-                acc = self.compute_accuracy(logits, tokenized)
-                correct += acc * len(images)
-                total += len(images)
-
-        avg_loss = total_loss / len(self.val_loader)
-        accuracy = correct / total
-        return avg_loss, accuracy 
-
+        result = {
+            "generated_ids": generated_ids[:, :step + 1],  # 只返回实际生成的部分
+        }
+        
+        if is_training and target_answer is not None:
+            target_labels = target_answer[:, :len(all_logits)]
+            if target_labels.shape[1] < len(all_logits):
+                target_labels = torch.cat([target_labels, torch.full((target_labels.shape[0], len(all_logits) - target_labels.shape[1]), -100, dtype=target_labels.dtype, device=target_labels.device)], dim=1)
+            
+            stacked_logits = torch.stack(all_logits, dim=1)
+            loss = self.compute_loss(stacked_logits, target_labels)
+            
+            result.update({
+                "logits": stacked_logits,
+                "loss": loss
+            })
+        
+        return result
+        
 def run_demo(rank, world_size, args):
     os.environ['RANK'] = str(rank)            
     os.environ['LOCAL_RANK'] = str(rank)      
@@ -359,6 +279,7 @@ def run_demo(rank, world_size, args):
     os.environ['MASTER_ADDR'] = '127.0.0.1'  
     os.environ['MASTER_PORT'] = '6666'
     os.environ["HF_DATASETS_CACHE"] = "/cache/"
+    os.environ['TORCHELASTIC_ERROR_FILE'] = '/home/ma-user/work/zym/error.json'
 
     torch.npu.set_device(rank)  # 分配每个进程对应的设备
     dist.init_process_group(backend='hccl', rank=rank, world_size=world_size)
@@ -373,7 +294,7 @@ def run_demo(rank, world_size, args):
 def parse_args():
     parser = argparse.ArgumentParser(description="NPU Distributed Training")
     parser.add_argument('--epochs', type=int, default=5, help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=16, help='Batch size per NPU')
+    parser.add_argument('--batch_size', type=int, default=4, help='Batch size per NPU')
     parser.add_argument('--learning_rate', type=float, default=1e-5, help='Learning rate')
     parser.add_argument('--output_dir', type=str, default='./outputs', help='Where to save checkpoints')
     parser.add_argument('--log_dir', type=str, default='./logs', help='TensorBoard log dir')
